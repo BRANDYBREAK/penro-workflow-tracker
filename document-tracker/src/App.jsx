@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { ethers } from 'ethers';
 
-const CONTRACT_ADDRESS = "0xe423Ea3F2024Aa73954E98DaCfE6989b5430d4C2";
+const CONTRACT_ADDRESS = import.meta.env.VITE_CONTRACT_ADDRESS;
 
 const CONTRACT_ABI = [
   "function routeDocument(bytes32 documentHash, string calldata fromDesk, string calldata toDesk) external",
@@ -19,11 +19,63 @@ const STANDARD_DESKS = [
   "Custom..."
 ];
 
+const SOLIDITY_CODE_STRING = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract TurnaroundTimeTracker is Ownable {
+    
+    struct DocumentState {
+        string currentDesk; 
+        uint256 timeReceived;
+        bool isCompleted;
+    }
+
+    mapping(bytes32 => DocumentState) private _documentStates;
+
+    event DocumentRouted(bytes32 indexed documentHash, string fromDesk, string toDesk, uint256 timestamp);
+    event DocumentCompleted(bytes32 indexed documentHash, uint256 timestamp);
+
+    error InvalidInput();
+    error DocumentAlreadyCompleted();
+    error DocumentNotStarted();
+
+    constructor(address initialOwner) Ownable(initialOwner) {}
+
+    function routeDocument(bytes32 documentHash, string calldata fromDesk, string calldata toDesk) external onlyOwner {
+        if (documentHash == bytes32(0) || bytes(toDesk).length == 0) revert InvalidInput();
+        if (_documentStates[documentHash].isCompleted) revert DocumentAlreadyCompleted();
+
+        _documentStates[documentHash] = DocumentState({
+            currentDesk: toDesk,
+            timeReceived: block.timestamp,
+            isCompleted: false
+        });
+
+        emit DocumentRouted(documentHash, fromDesk, toDesk, block.timestamp);
+    }
+
+    function completeDocument(bytes32 documentHash) external onlyOwner {
+        if (_documentStates[documentHash].timeReceived == 0) revert DocumentNotStarted();
+        if (_documentStates[documentHash].isCompleted) revert DocumentAlreadyCompleted();
+
+        _documentStates[documentHash].isCompleted = true;
+        
+        emit DocumentCompleted(documentHash, block.timestamp);
+    }
+
+    function getDocumentState(bytes32 documentHash) external view returns (string memory currentDesk, uint256 timeReceived, bool isCompleted) {
+        DocumentState memory state = _documentStates[documentHash];
+        return (state.currentDesk, state.timeReceived, state.isCompleted);
+    }
+}`;
+
 export default function App() {
   const [walletAddress, setWalletAddress] = useState("");
   const [status, setStatus] = useState("");
   const [isConnecting, setIsConnecting] = useState(false);
-  const [activeTab, setActiveTab] = useState("route");
+  const [activeTab, setActiveTab] = useState("route"); // route, complete, view, history, guide, code
 
   // Route Form States
   const [fromDeskSelect, setFromDeskSelect] = useState(STANDARD_DESKS[0]);
@@ -34,15 +86,17 @@ export default function App() {
   const [lastHash, setLastHash] = useState("");
   const [txHash, setTxHash] = useState("");
 
-  // History / Local Storage state for forgetting fingerprints
-  const [historyList, setHistoryList] = useState([]);
+  // Complete Document State
+  const [completeHash, setCompleteHash] = useState("");
+  const [completing, setCompleting] = useState("");
 
-  // View / Lookup States
+  // History & Lookup States
+  const [historyList, setHistoryList] = useState([]);
   const [lookupHash, setLookupHash] = useState("");
   const [lookupLoading, setLookupLoading] = useState(false);
   const [lookupResult, setLookupResult] = useState(null);
+  const [copied, setCopied] = useState(false);
 
-  // Auto-detect wallet connection and load saved transaction history on page load
   useEffect(() => {
     async function checkConnection() {
       if (window.ethereum) {
@@ -59,7 +113,6 @@ export default function App() {
     }
     checkConnection();
 
-    // Load saved transactions from browser local storage so you never lose them
     const savedHistory = localStorage.getItem("penro_tx_history");
     if (savedHistory) {
       try {
@@ -80,7 +133,6 @@ export default function App() {
     }
   }, []);
 
-  // Helper to save history items
   const saveToHistory = (hash, tx, from, to) => {
     const newItem = { hash, txHash: tx, fromDesk: from, toDesk: to, date: new Date().toLocaleString() };
     const updated = [newItem, ...historyList];
@@ -129,11 +181,7 @@ export default function App() {
       setStatus("Wallet connected successfully!");
     } catch (err) {
       console.error(err);
-      if (err.info?.error?.code === -32002 || err.code === -32002) {
-        setStatus("MetaMask prompt is already open. Check your browser extension.");
-      } else {
-        setStatus(`Error: ${err.reason || err.message}`);
-      }
+      setStatus(`Error: ${err.reason || err.message}`);
     } finally {
       setIsConnecting(false);
     }
@@ -157,23 +205,23 @@ export default function App() {
     try {
       setLoading(true);
       setTxHash("");
-      setStatus("Generating secure document fingerprint...");
+      setStatus("Generating secure document hash...");
 
       const newHash = ethers.hexlify(ethers.randomBytes(32));
       setLastHash(newHash);
 
-      setStatus(`Fingerprint ready! Waiting for MetaMask approval.`);
+      setStatus(`Fingerprint generated! Waiting for MetaMask approval.`);
 
       const provider = new ethers.BrowserProvider(window.ethereum);
       const signer = await provider.getSigner();
       const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
 
-      setStatus("Sending transaction to the blockchain...");
+      setStatus("Sending transaction to Sepolia blockchain...");
       const tx = await contract.routeDocument(newHash, finalFrom, finalTo);
       
       setTxHash(tx.hash);
       saveToHistory(newHash, tx.hash, finalFrom, finalTo);
-      setStatus(`Flight in progress! Waiting for block confirmation...`);
+      setStatus(`Broadcasted! Waiting for block confirmation...`);
       
       const receipt = await tx.wait();
       setStatus(`Success! Document movement sealed in block #${receipt.blockNumber}`);
@@ -182,6 +230,36 @@ export default function App() {
       setStatus(`Execution Failed: ${err.reason || err.message}`);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleComplete(e) {
+    e.preventDefault();
+    if (!walletAddress) {
+      setStatus("Please connect your wallet first.");
+      return;
+    }
+    if (!completeHash) return;
+
+    try {
+      setCompleting(true);
+      setStatus("Submitting completion transaction to Sepolia...");
+
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+
+      const tx = await contract.completeDocument(completeHash.trim());
+      setStatus(`Completion broadcasted! Tx: ${tx.hash.slice(0, 10)}... Waiting for confirmation.`);
+      
+      const receipt = await tx.wait();
+      setStatus(`Success! Document finalized and closed in block #${receipt.blockNumber}`);
+      setCompleteHash("");
+    } catch (err) {
+      console.error(err);
+      setStatus(`Execution Failed: ${err.reason || err.message}`);
+    } finally {
+      setCompleting(false);
     }
   }
 
@@ -205,66 +283,80 @@ export default function App() {
       });
     } catch (err) {
       console.error(err);
-      alert("Document not found or invalid fingerprint format.");
+      alert("Document not found or invalid format.");
     } finally {
       setLookupLoading(false);
     }
   }
 
-  return (
-    <div className="min-h-screen flex flex-col justify-center items-center p-4 md:p-6 font-sans relative overflow-hidden bg-stone-900">
-      
-      {/* Background Image Container based on provided nature/forest aesthetic */}
-      <div 
-        className="absolute inset-0 z-0 bg-cover bg-center filter brightness-50"
-        style={{ backgroundImage: `url('/BG.jpg')` }}
-      />
+  const copyToClipboard = () => {
+    navigator.clipboard.writeText(SOLIDITY_CODE_STRING);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
 
-      <div className="w-full max-w-2xl bg-emerald-950/90 backdrop-blur-md border-4 border-emerald-600 shadow-[0_0_40px_rgba(5,150,105,0.4)] rounded-lg overflow-hidden mb-8 relative z-10 text-emerald-100">
+  return (
+    <div className="min-h-screen bg-stone-50 flex flex-col justify-center items-center p-4 md:p-6 font-sans">
+      <div className="w-full max-w-2xl bg-white border-2 border-emerald-800 shadow-xl rounded-lg overflow-hidden mb-8">
         
-        {/* DENR Header Banner */}
-        <div className="bg-emerald-900/90 p-6 border-b-4 border-emerald-600 text-center relative">
-          <div className="text-3xl mb-1">🌿🌳</div>
-          <p className="text-xs font-bold uppercase tracking-widest text-emerald-300">Republic of the Philippines</p>
-          <h1 className="text-xl md:text-2xl font-black uppercase tracking-wider mt-1 text-white">
+        {/* Minimalist Clean DENR Header Banner */}
+        <div className="bg-emerald-800 text-white p-6 border-b-2 border-emerald-900 text-center">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-emerald-200">Republic of the Philippines</p>
+          <h1 className="text-xl md:text-2xl font-black uppercase tracking-wider mt-1">
             DENR PENRO Palawan
           </h1>
-          <p className="text-xs text-emerald-200 mt-1 font-mono">Immutable Forest & Document Workflow Tracker</p>
+          <p className="text-xs text-emerald-100 mt-1 font-mono">Immutable Workflow & Turnaround Tracker</p>
         </div>
 
-        {/* Navigation Tabs */}
-        <div className="grid grid-cols-4 border-b-2 border-emerald-600 bg-emerald-950">
+        {/* Minimalist Tabs */}
+        <div className="grid grid-cols-6 border-b-2 border-emerald-800 bg-emerald-50 text-emerald-900 text-center font-bold text-[9px] md:text-[10px] uppercase tracking-wider">
           <button
             onClick={() => setActiveTab("route")}
-            className={`py-3 text-[10px] md:text-xs font-black uppercase tracking-wider transition-all cursor-pointer ${
-              activeTab === "route" ? "bg-emerald-600 text-white font-bold" : "text-emerald-300 hover:bg-emerald-900"
+            className={`py-3 transition-all cursor-pointer ${
+              activeTab === "route" ? "bg-emerald-800 text-white" : "hover:bg-emerald-100"
             }`}
           >
-            📤 Route
+            Route
+          </button>
+          <button
+            onClick={() => setActiveTab("complete")}
+            className={`py-3 transition-all border-x border-emerald-800 cursor-pointer ${
+              activeTab === "complete" ? "bg-emerald-800 text-white" : "hover:bg-emerald-100"
+            }`}
+          >
+            Complete
           </button>
           <button
             onClick={() => setActiveTab("view")}
-            className={`py-3 text-[10px] md:text-xs font-black uppercase tracking-wider transition-all border-x-2 border-emerald-600 cursor-pointer ${
-              activeTab === "view" ? "bg-emerald-600 text-white font-bold" : "text-emerald-300 hover:bg-emerald-900"
+            className={`py-3 transition-all cursor-pointer ${
+              activeTab === "view" ? "bg-emerald-800 text-white" : "hover:bg-emerald-100"
             }`}
           >
-            🔍 Track
+            Track
           </button>
           <button
             onClick={() => setActiveTab("history")}
-            className={`py-3 text-[10px] md:text-xs font-black uppercase tracking-wider transition-all cursor-pointer ${
-              activeTab === "history" ? "bg-emerald-600 text-white font-bold" : "text-emerald-300 hover:bg-emerald-900"
+            className={`py-3 transition-all border-x border-emerald-800 cursor-pointer ${
+              activeTab === "history" ? "bg-emerald-800 text-white" : "hover:bg-emerald-100"
             }`}
           >
-            📜 History
+            History
           </button>
           <button
-            onClick={() => setActiveTab("presentation")}
-            className={`py-3 text-[10px] md:text-xs font-black uppercase tracking-wider transition-all border-l-2 border-emerald-600 cursor-pointer ${
-              activeTab === "presentation" ? "bg-emerald-600 text-white font-bold" : "text-emerald-300 hover:bg-emerald-900"
+            onClick={() => setActiveTab("guide")}
+            className={`py-3 transition-all cursor-pointer ${
+              activeTab === "guide" ? "bg-emerald-800 text-white" : "hover:bg-emerald-100"
             }`}
           >
-            📖 Guide
+            Guide
+          </button>
+          <button
+            onClick={() => setActiveTab("code")}
+            className={`py-3 transition-all border-l border-emerald-800 cursor-pointer ${
+              activeTab === "code" ? "bg-emerald-800 text-white" : "hover:bg-emerald-100"
+            }`}
+          >
+            Code
           </button>
         </div>
 
@@ -275,17 +367,17 @@ export default function App() {
               <button 
                 onClick={connectWallet}
                 disabled={isConnecting}
-                className="w-full py-3 bg-emerald-700 hover:bg-emerald-600 text-white font-bold uppercase tracking-widest text-sm transition-all cursor-pointer disabled:opacity-50 border-2 border-emerald-500 shadow-lg flex items-center justify-center gap-2 rounded"
+                className="w-full py-3 bg-emerald-700 hover:bg-emerald-800 text-white font-bold uppercase tracking-widest text-xs transition-all cursor-pointer disabled:opacity-50 border border-emerald-900 rounded shadow-sm"
               >
-                <span>🦊🌿</span> {isConnecting ? "Connecting..." : "Connect MetaMask Wallet"}
+                {isConnecting ? "Connecting..." : "Connect MetaMask Wallet"}
               </button>
             ) : (
-              <div className="p-3 border-2 border-emerald-500 bg-emerald-900/60 flex justify-between items-center rounded">
+              <div className="p-3 border border-emerald-700 bg-emerald-50 flex justify-between items-center rounded">
                 <div>
-                  <p className="text-[10px] font-bold uppercase text-emerald-300">Connected Staff Node</p>
-                  <p className="text-xs font-mono text-emerald-100 font-semibold">{walletAddress.slice(0, 8)}...{walletAddress.slice(-6)}</p>
+                  <p className="text-[10px] font-bold uppercase text-emerald-800">Connected Admin Node</p>
+                  <p className="text-xs font-mono text-emerald-950 font-semibold">{walletAddress.slice(0, 8)}...{walletAddress.slice(-6)}</p>
                 </div>
-                <span className="inline-block w-3 h-3 bg-emerald-400 rounded-full animate-ping"></span>
+                <span className="inline-block w-2.5 h-2.5 bg-emerald-600 rounded-full animate-pulse"></span>
               </div>
             )}
           </div>
@@ -293,11 +385,11 @@ export default function App() {
           {activeTab === "route" && (
             <form onSubmit={handleRoute} className="space-y-4">
               <div>
-                <label className="block text-xs font-bold uppercase mb-1 text-emerald-300">📍 From Which Office / Desk?</label>
+                <label className="block text-xs font-bold uppercase mb-1 text-emerald-950">From Desk / Unit</label>
                 <select 
                   value={fromDeskSelect}
                   onChange={(e) => setFromDeskSelect(e.target.value)}
-                  className="w-full p-3 border-2 border-emerald-600 bg-emerald-950 text-emerald-100 text-sm font-medium focus:outline-none mb-2 rounded"
+                  className="w-full p-2.5 border border-emerald-700 bg-white text-emerald-950 text-xs font-medium focus:outline-none mb-2 rounded"
                 >
                   {STANDARD_DESKS.map((desk, idx) => (
                     <option key={idx} value={desk}>{desk}</option>
@@ -306,21 +398,21 @@ export default function App() {
                 {fromDeskSelect === "Custom..." && (
                   <input 
                     type="text" 
-                    placeholder="Type custom origin desk..."
+                    placeholder="Enter custom origin desk..."
                     value={fromDeskCustom}
                     onChange={(e) => setFromDeskCustom(e.target.value)}
-                    className="w-full p-3 border-2 border-emerald-600 bg-emerald-950 text-emerald-100 text-sm focus:outline-none rounded"
+                    className="w-full p-2.5 border border-emerald-700 text-xs focus:outline-none rounded"
                     required
                   />
                 )}
               </div>
 
               <div>
-                <label className="block text-xs font-bold uppercase mb-1 text-emerald-300">🎯 Send To Which Office / Desk?</label>
+                <label className="block text-xs font-bold uppercase mb-1 text-emerald-950">To Desk / Unit</label>
                 <select 
                   value={toDeskSelect}
                   onChange={(e) => setToDeskSelect(e.target.value)}
-                  className="w-full p-3 border-2 border-emerald-600 bg-emerald-950 text-emerald-100 text-sm font-medium focus:outline-none mb-2 rounded"
+                  className="w-full p-2.5 border border-emerald-700 bg-white text-emerald-950 text-xs font-medium focus:outline-none mb-2 rounded"
                 >
                   {STANDARD_DESKS.map((desk, idx) => (
                     <option key={idx} value={desk}>{desk}</option>
@@ -329,10 +421,10 @@ export default function App() {
                 {toDeskSelect === "Custom..." && (
                   <input 
                     type="text" 
-                    placeholder="Type custom destination desk..."
+                    placeholder="Enter custom destination desk..."
                     value={toDeskCustom}
                     onChange={(e) => setToDeskCustom(e.target.value)}
-                    className="w-full p-3 border-2 border-emerald-600 bg-emerald-950 text-emerald-100 text-sm focus:outline-none rounded"
+                    className="w-full p-2.5 border border-emerald-700 text-xs focus:outline-none rounded"
                     required
                   />
                 )}
@@ -341,24 +433,48 @@ export default function App() {
               <button 
                 type="submit"
                 disabled={loading || !walletAddress}
-                className="w-full py-4 bg-emerald-700 hover:bg-emerald-600 text-white font-black uppercase tracking-widest border-2 border-emerald-500 transition-all cursor-pointer disabled:opacity-50 mt-2 shadow-xl flex items-center justify-center gap-2 rounded"
+                className="w-full py-3.5 bg-emerald-800 hover:bg-emerald-900 text-white font-bold uppercase tracking-widest text-xs transition-all cursor-pointer disabled:opacity-50 mt-2 shadow rounded"
               >
-                <span>🌳⚡</span> {loading ? "Locking Record..." : "Lock Movement On-Chain"}
+                {loading ? "Processing..." : "Generate Hash & Route On-Chain"}
               </button>
             </form>
           )} 
+
+          {activeTab === "complete" && (
+            <form onSubmit={handleComplete} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold uppercase mb-1 text-emerald-950">Document Hash to Complete (bytes32)</label>
+                <input 
+                  type="text" 
+                  placeholder="0x..."
+                  value={completeHash}
+                  onChange={(e) => setCompleteHash(e.target.value)}
+                  className="w-full p-2.5 border border-emerald-700 font-mono text-xs focus:outline-none rounded"
+                  required
+                />
+              </div>
+
+              <button 
+                type="submit"
+                disabled={completing || !walletAddress}
+                className="w-full py-3.5 bg-emerald-800 hover:bg-emerald-900 text-white font-bold uppercase tracking-widest text-xs transition-all cursor-pointer disabled:opacity-50 shadow rounded"
+              >
+                {completing ? "Finalizing..." : "Complete Document Lifecycle"}
+              </button>
+            </form>
+          )}
 
           {activeTab === "view" && (
             <div className="space-y-4">
               <form onSubmit={(e) => { e.preventDefault(); handleLookup(); }} className="space-y-4">
                 <div>
-                  <label className="block text-xs font-bold uppercase mb-1 text-emerald-300">🔎 Document Fingerprint (Hash)</label>
+                  <label className="block text-xs font-bold uppercase mb-1 text-emerald-950">Document Hash (bytes32)</label>
                   <input 
                     type="text" 
-                    placeholder="Paste 0x... code here"
+                    placeholder="0x..."
                     value={lookupHash}
                     onChange={(e) => setLookupHash(e.target.value)}
-                    className="w-full p-3 border-2 border-emerald-600 bg-emerald-950 text-emerald-100 font-mono text-xs focus:outline-none rounded"
+                    className="w-full p-2.5 border border-emerald-700 font-mono text-xs focus:outline-none rounded"
                     required
                   />
                 </div>
@@ -366,17 +482,17 @@ export default function App() {
                 <button 
                   type="submit"
                   disabled={lookupLoading}
-                  className="w-full py-4 bg-emerald-700 hover:bg-emerald-600 text-white font-black uppercase tracking-widest border-2 border-emerald-500 transition-all cursor-pointer disabled:opacity-50 shadow-xl flex items-center justify-center gap-2 rounded"
+                  className="w-full py-3.5 bg-emerald-800 hover:bg-emerald-900 text-white font-bold uppercase tracking-widest text-xs transition-all cursor-pointer disabled:opacity-50 shadow rounded"
                 >
-                  <span>🔍</span> {lookupLoading ? "Searching Ledger..." : "Check Live Status"}
+                  {lookupLoading ? "Querying..." : "Fetch On-Chain State"}
                 </button>
               </form>
 
               {lookupResult && (
-                <div className="mt-4 p-4 border-2 border-emerald-600 bg-emerald-950 text-xs font-mono space-y-2 rounded text-emerald-200">
-                  <p><span className="font-bold text-emerald-400">🏢 Current Location:</span> {lookupResult.currentDesk}</p>
-                  <p><span className="font-bold text-emerald-400">⏱️ Exact Arrival Time:</span> {lookupResult.timeReceived}</p>
-                  <p><span className="font-bold text-emerald-400">✅ Status:</span> {lookupResult.isCompleted ? "Completed & Closed 📁" : "Still Active 🌳"}</p>
+                <div className="mt-4 p-3 border border-emerald-700 bg-emerald-50 text-xs font-mono space-y-1.5 rounded text-emerald-950">
+                  <p><span className="font-bold">Current Desk:</span> {lookupResult.currentDesk}</p>
+                  <p><span className="font-bold">Timestamp:</span> {lookupResult.timeReceived}</p>
+                  <p><span className="font-bold">Completed:</span> {lookupResult.isCompleted ? "Yes (Closed)" : "No (Active)"}</p>
                 </div>
               )}
             </div>
@@ -384,38 +500,38 @@ export default function App() {
 
           {activeTab === "history" && (
             <div className="space-y-3">
-              <h3 className="text-xs font-bold uppercase text-emerald-300 mb-2">📜 Recent Transactions & Fingerprints History</h3>
-              <p className="text-[11px] text-emerald-200 mb-3">Forgot your fingerprint? Click any item below to automatically query it or view its transaction directly on Etherscan.</p>
+              <h3 className="text-xs font-bold uppercase text-emerald-950 mb-1">Recent Transactions History</h3>
+              <p className="text-[11px] text-stone-600 mb-3">Click any item below to load its status or inspect it directly on Etherscan.</p>
               
               {historyList.length === 0 ? (
-                <div className="p-4 bg-emerald-950/60 border border-emerald-700 text-center text-xs text-emerald-400 rounded">
-                  No local transaction history found yet. Route a document first!
+                <div className="p-4 bg-stone-50 border border-stone-200 text-center text-xs text-stone-500 rounded">
+                  No local transaction history found yet.
                 </div>
               ) : (
-                <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
                   {historyList.map((item, index) => (
-                    <div key={index} className="p-3 bg-emerald-950 border border-emerald-600 rounded text-xs space-y-1">
-                      <div className="flex justify-between text-[10px] text-emerald-400 font-mono">
-                        <span>{item.fromDesk} ➔ {item.toDesk}</span>
+                    <div key={index} className="p-3 bg-white border border-emerald-700 rounded text-xs space-y-1 shadow-sm">
+                      <div className="flex justify-between text-[10px] text-stone-500 font-mono">
+                        <span className="font-bold text-emerald-900">{item.fromDesk} ➔ {item.toDesk}</span>
                         <span>{item.date}</span>
                       </div>
-                      <div className="font-mono text-[11px] text-white truncate">
-                        <span className="text-emerald-400">Hash:</span> {item.hash}
+                      <div className="font-mono text-[11px] text-stone-800 truncate">
+                        <span className="text-emerald-700 font-bold">Hash:</span> {item.hash}
                       </div>
                       <div className="flex gap-2 pt-1">
                         <button 
                           onClick={() => { setLookupHash(item.hash); setActiveTab("view"); handleLookup(item.hash); }}
-                          className="px-2 py-1 bg-emerald-800 hover:bg-emerald-700 text-white rounded text-[10px] font-bold"
+                          className="px-2 py-1 bg-emerald-100 hover:bg-emerald-200 text-emerald-900 rounded text-[10px] font-bold"
                         >
-                          🔍 Check Status
+                          Check Status
                         </button>
                         <a 
                           href={`https://sepolia.etherscan.io/tx/${item.txHash}`}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="px-2 py-1 bg-emerald-900 hover:bg-emerald-800 text-emerald-200 rounded text-[10px] font-bold underline"
+                          className="px-2 py-1 bg-stone-100 hover:bg-stone-200 text-stone-800 rounded text-[10px] font-bold underline"
                         >
-                          View on Etherscan ↗
+                          Etherscan ↗
                         </a>
                       </div>
                     </div>
@@ -425,53 +541,90 @@ export default function App() {
             </div>
           )}
 
-          {activeTab === "presentation" && (
-            <div className="space-y-4 text-emerald-100 text-sm">
-              <div className="bg-emerald-950/80 p-4 border-2 border-emerald-600/60 rounded">
-                <h3 className="font-black uppercase text-emerald-300 flex items-center gap-2 text-base">
-                  <span>🛡️</span> What if I forget the document fingerprint?
-                </h3>
-                <p className="text-xs mt-2 text-emerald-200 leading-relaxed">
-                  Don't worry! We added a <strong>History Tab (📜)</strong> right inside this app. Every time you route a document, it safely saves your fingerprint and Etherscan link in your browser memory so you can click them instantly anytime!
-                </p>
+          {activeTab === "guide" && (
+            <div className="space-y-4 text-xs text-stone-800">
+              <div className="border-l-2 border-emerald-800 pl-3 py-0.5">
+                <h3 className="font-bold uppercase text-emerald-900">Smart Contract Logic & Flow</h3>
+                <p className="text-[11px] text-stone-600 mt-0.5">Simplified overview of the deployed Solidity contract (`TurnaroundTimeTracker`).</p>
               </div>
 
-              <div className="bg-emerald-950/80 p-4 border-2 border-emerald-600/60 rounded">
-                <h3 className="font-black uppercase text-emerald-300 flex items-center gap-2 text-base">
-                  <span>🌐</span> Direct Etherscan Links
-                </h3>
-                <p className="text-xs mt-2 text-emerald-200 leading-relaxed">
-                  Every transaction generates a clickable link straight to <a href="https://sepolia.etherscan.io" target="_blank" rel="noopener noreferrer" className="underline text-emerald-300 font-bold">Sepolia Etherscan</a>, allowing anyone to inspect block confirmations and timestamps publicly.
-                </p>
+              <div className="space-y-3 font-mono text-[11px]">
+                <div className="p-2.5 bg-stone-50 border border-emerald-700 rounded">
+                  <span className="font-bold text-emerald-900">1. struct DocumentState</span>
+                  <p className="font-sans text-[11px] text-stone-600 mt-1">
+                    Stores record properties on-chain: <code className="bg-emerald-100 px-1 text-emerald-900">currentDesk</code>, <code className="bg-emerald-100 px-1 text-emerald-900">timeReceived</code>, and <code className="bg-emerald-100 px-1 text-emerald-900">isCompleted</code>.
+                  </p>
+                </div>
+
+                <div className="p-2.5 bg-stone-50 border border-emerald-700 rounded">
+                  <span className="font-bold text-emerald-900">2. routeDocument(...)</span>
+                  <p className="font-sans text-[11px] text-stone-600 mt-1">
+                    Protected by OpenZeppelin's <code className="bg-emerald-100 px-1 text-emerald-900">onlyOwner</code> modifier. Updates document location and etches an unalterable timestamp.
+                  </p>
+                </div>
+
+                <div className="p-2.5 bg-stone-50 border border-emerald-700 rounded">
+                  <span className="font-bold text-emerald-900">3. completeDocument(...)</span>
+                  <p className="font-sans text-[11px] text-stone-600 mt-1">
+                    Locks the document state permanently upon clearance, stopping the turnaround clock.
+                  </p>
+                </div>
+
+                <div className="p-2.5 bg-stone-50 border border-emerald-700 rounded">
+                  <span className="font-bold text-emerald-900">4. getDocumentState(...)</span>
+                  <p className="font-sans text-[11px] text-stone-600 mt-1">
+                    Public read-only view function. Pulls real-time workflow status directly from the public Sepolia ledger.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === "code" && (
+            <div className="space-y-3">
+              <div className="flex justify-between items-center">
+                <span className="text-xs font-bold uppercase text-emerald-950 font-mono">TurnaroundTimeTracker.sol</span>
+                <button 
+                  onClick={copyToClipboard}
+                  className="px-3 py-1 bg-emerald-800 hover:bg-emerald-900 text-white rounded text-[11px] font-bold transition-all shadow-sm cursor-pointer"
+                >
+                  {copied ? "Copied to Clipboard!" : "Copy Code"}
+                </button>
+              </div>
+              
+              <div className="bg-emerald-950 text-emerald-200 p-4 rounded border border-emerald-900 overflow-x-auto max-h-72 shadow-inner">
+                <pre className="font-mono text-[10px] md:text-xs leading-relaxed whitespace-pre">
+                  {SOLIDITY_CODE_STRING}
+                </pre>
               </div>
             </div>
           )}
 
           {/* Last Hash Display */}
           {lastHash && activeTab === "route" && (
-            <div className="mt-4 p-3 bg-emerald-950 border border-emerald-600 text-[11px] font-mono break-all text-emerald-200 rounded">
-              <span className="font-bold text-emerald-400">🔑 Document Fingerprint Code:</span> {lastHash}
+            <div className="mt-4 p-2.5 bg-stone-50 border border-emerald-700 text-[11px] font-mono break-all text-emerald-950 rounded">
+              <span className="font-bold text-emerald-800">Latest Hash:</span> {lastHash}
             </div>
           )}
 
           {/* Etherscan Link Display */}
           {txHash && activeTab === "route" && (
-            <div className="mt-2 p-3 bg-emerald-950 border border-emerald-600 text-xs font-mono break-all flex flex-col gap-1 rounded">
-              <span className="font-bold text-emerald-400">🌐 Public Record:</span>
+            <div className="mt-2 p-2.5 bg-emerald-50 border border-emerald-700 text-xs font-mono break-all flex flex-col gap-1 rounded">
+              <span className="font-bold text-emerald-800">Explorer Link:</span>
               <a 
                 href={`https://sepolia.etherscan.io/tx/${txHash}`} 
                 target="_blank" 
                 rel="noopener noreferrer"
-                className="text-emerald-300 underline font-bold hover:text-white"
+                className="text-emerald-700 underline font-semibold hover:text-emerald-900"
               >
-                View Permanent Proof on Sepolia Etherscan ↗
+                View Transaction on Sepolia Etherscan ↗
               </a>
             </div>
           )}
 
           {/* Terminal Status Output */}
           {status && (
-            <div className="mt-4 p-4 bg-emerald-950 text-emerald-200 text-xs font-mono border-2 border-emerald-600 leading-relaxed break-words shadow-inner rounded">
+            <div className="mt-4 p-3 bg-emerald-950 text-emerald-200 text-xs font-mono border border-emerald-900 leading-relaxed break-words rounded">
               {`> ${status}`}
             </div>
           )}
