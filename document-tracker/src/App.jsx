@@ -5,6 +5,7 @@ const CONTRACT_ADDRESS = "0xe423Ea3F2024Aa73954E98DaCfE6989b5430d4C2";
 
 const CONTRACT_ABI = [
   "function routeDocument(bytes32 documentHash, string calldata fromDesk, string calldata toDesk) external",
+  "function completeDocument(bytes32 documentHash) external",
   "function getDocumentState(bytes32 documentHash) external view returns (string currentDesk, uint256 timeReceived, bool isCompleted)"
 ];
 
@@ -22,7 +23,7 @@ export default function App() {
   const [walletAddress, setWalletAddress] = useState("");
   const [status, setStatus] = useState("");
   const [isConnecting, setIsConnecting] = useState(false);
-  const [activeTab, setActiveTab] = useState("route"); // "route" or "view"
+  const [activeTab, setActiveTab] = useState("route"); // "route", "view", or "presentation"
 
   // Route Form States
   const [fromDeskSelect, setFromDeskSelect] = useState(STANDARD_DESKS[0]);
@@ -55,7 +56,6 @@ export default function App() {
     }
     checkConnection();
 
-    // Listen for account switches in MetaMask
     if (window.ethereum) {
       window.ethereum.on('accountsChanged', (accounts) => {
         if (accounts.length > 0) {
@@ -190,7 +190,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-stone-100 flex flex-col justify-center items-center p-4 md:p-6 font-sans">
-      <div className="w-full max-w-xl bg-white border-4 border-emerald-900 shadow-2xl overflow-hidden">
+      <div className="w-full max-w-2xl bg-white border-4 border-emerald-900 shadow-2xl overflow-hidden mb-8">
         
         {/* DENR Header Banner */}
         <div className="bg-emerald-900 text-white p-6 border-b-4 border-emerald-950 text-center">
@@ -202,10 +202,10 @@ export default function App() {
         </div>
 
         {/* Navigation Tabs */}
-        <div className="grid grid-cols-2 border-b-2 border-emerald-900 bg-emerald-50">
+        <div className="grid grid-cols-3 border-b-2 border-emerald-900 bg-emerald-50">
           <button
             onClick={() => setActiveTab("route")}
-            className={`py-3 text-xs font-black uppercase tracking-wider transition-all cursor-pointer ${
+            className={`py-3 text-[11px] md:text-xs font-black uppercase tracking-wider transition-all cursor-pointer ${
               activeTab === "route" 
                 ? "bg-emerald-900 text-white" 
                 : "text-emerald-900 hover:bg-emerald-100"
@@ -215,13 +215,23 @@ export default function App() {
           </button>
           <button
             onClick={() => setActiveTab("view")}
-            className={`py-3 text-xs font-black uppercase tracking-wider transition-all border-l-2 border-emerald-900 cursor-pointer ${
+            className={`py-3 text-[11px] md:text-xs font-black uppercase tracking-wider transition-all border-x-2 border-emerald-900 cursor-pointer ${
               activeTab === "view" 
                 ? "bg-emerald-900 text-white" 
                 : "text-emerald-900 hover:bg-emerald-100"
             }`}
           >
-            Verify On-Chain Status
+            Verify Status
+          </button>
+          <button
+            onClick={() => setActiveTab("presentation")}
+            className={`py-3 text-[11px] md:text-xs font-black uppercase tracking-wider transition-all cursor-pointer ${
+              activeTab === "presentation" 
+                ? "bg-emerald-900 text-white" 
+                : "text-emerald-900 hover:bg-emerald-100"
+            }`}
+          >
+            System Briefing
           </button>
         </div>
 
@@ -247,7 +257,7 @@ export default function App() {
             )}
           </div>
 
-          {activeTab === "route" ? (
+          {activeTab === "route" && (
             /* ROUTE FORM */
             <form onSubmit={handleRoute} className="space-y-4">
               <div>
@@ -304,7 +314,9 @@ export default function App() {
                 {loading ? "Processing Transaction..." : "Generate Hash & Route On-Chain"}
               </button>
             </form>
-          ) : (
+          )} 
+
+          {activeTab === "view" && (
             /* VIEW / LOOKUP SECTION */
             <form onSubmit={handleLookup} className="space-y-4">
               <div>
@@ -335,6 +347,51 @@ export default function App() {
                 </div>
               )}
             </form>
+          )}
+
+          {activeTab === "presentation" && (
+            /* SYSTEM PRESENTATION / BRIEFING */
+            <div className="space-y-6 text-emerald-950">
+              <div className="border-l-4 border-emerald-900 pl-4 py-1">
+                <h2 className="font-black text-sm uppercase tracking-wider text-emerald-900">1. The Problem: ARTA Compliance & Delays</h2>
+                <p className="text-xs mt-1 text-stone-700 leading-relaxed">
+                  Traditional paper and internal database routing for Travelling Expense Vouchers (TEVs) and financial payables suffer from processing bottlenecks, lack transparency, and leave processing timestamps vulnerable to internal modification or tampering by rogue administrators.
+                </p>
+              </div>
+
+              <div className="border-l-4 border-emerald-900 pl-4 py-1">
+                <h2 className="font-black text-sm uppercase tracking-wider text-emerald-900">2. The Solution: Immutable Ledger Layer</h2>
+                <p className="text-xs mt-1 text-stone-700 leading-relaxed">
+                  We integrate an append-only cryptographic state machine deployed on the Ethereum Sepolia Testnet. This provides an unalterable audit trail that strictly enforces Anti-Red Tape Act (ARTA) turnaround time compliance without relying on centralized database edits.
+                </p>
+              </div>
+
+              <div className="border-l-4 border-emerald-900 pl-4 py-1">
+                <h2 className="font-black text-sm uppercase tracking-wider text-emerald-900">3. Core Smart Contract Architecture</h2>
+                <div className="mt-2 space-y-3">
+                  <div className="bg-stone-50 p-3 border border-emerald-900 rounded font-mono text-[11px]">
+                    <span className="font-bold text-emerald-900">routeDocument(bytes32 documentHash, string fromDesk, string toDesk)</span>
+                    <p className="text-stone-600 font-sans mt-1">
+                      Restricted via OpenZeppelin's <code className="bg-emerald-100 px-1">onlyOwner</code> modifier. Updates the active location of the document and stamps the exact block timestamp, preventing backdating or fraudulent turnaround logging.
+                    </p>
+                  </div>
+
+                  <div className="bg-stone-50 p-3 border border-emerald-900 rounded font-mono text-[11px]">
+                    <span className="font-bold text-emerald-900">completeDocument(bytes32 documentHash)</span>
+                    <p className="text-stone-600 font-sans mt-1">
+                      Finalizes the document lifecycle. Locks the workflow state permanently and stops the turnaround clock, ensuring accountability upon voucher clearance.
+                    </p>
+                  </div>
+
+                  <div className="bg-stone-50 p-3 border border-emerald-900 rounded font-mono text-[11px]">
+                    <span className="font-bold text-emerald-900">getDocumentState(bytes32 documentHash)</span>
+                    <p className="text-stone-600 font-sans mt-1">
+                      Public view function. Allows any auditor or staff member to fetch the current desk, entry timestamp, and completion status directly from the public blockchain.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
           )}
 
           {/* Last Hash Display */}
