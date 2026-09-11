@@ -6,7 +6,11 @@ const CONTRACT_ADDRESS = import.meta.env.VITE_CONTRACT_ADDRESS;
 const CONTRACT_ABI = [
   "function routeDocument(bytes32 documentHash, string calldata fromDesk, string calldata toDesk) external",
   "function completeDocument(bytes32 documentHash) external",
-  "function getDocumentState(bytes32 documentHash) external view returns (string currentDesk, uint256 timeReceived, bool isCompleted)"
+  "function getDocumentState(bytes32 documentHash) external view returns (string currentDesk, uint256 timeReceived, bool isCompleted)",
+  "function authorizeWallet(address wallet) external",
+  "function revokeWallet(address wallet) external",
+  "function authorizedWallets(address) external view returns (bool)",
+  "function owner() external view returns (address)"
 ];
 
 const STANDARD_DESKS = [
@@ -33,17 +37,38 @@ contract TurnaroundTimeTracker is Ownable {
     }
 
     mapping(bytes32 => DocumentState) private _documentStates;
+    mapping(address => bool) public authorizedWallets;
 
     event DocumentRouted(bytes32 indexed documentHash, string fromDesk, string toDesk, uint256 timestamp);
     event DocumentCompleted(bytes32 indexed documentHash, uint256 timestamp);
+    event WalletAuthorized(address indexed wallet);
+    event WalletRevoked(address indexed wallet);
 
     error InvalidInput();
     error DocumentAlreadyCompleted();
     error DocumentNotStarted();
+    error UnauthorizedWallet();
 
-    constructor(address initialOwner) Ownable(initialOwner) {}
+    constructor(address initialOwner) Ownable(initialOwner) {
+        authorizedWallets[initialOwner] = true;
+    }
 
-    function routeDocument(bytes32 documentHash, string calldata fromDesk, string calldata toDesk) external onlyOwner {
+    modifier onlyAuthorized() {
+        if (!authorizedWallets[msg.sender]) revert UnauthorizedWallet();
+        _;
+    }
+
+    function authorizeWallet(address wallet) external onlyOwner {
+        authorizedWallets[wallet] = true;
+        emit WalletAuthorized(wallet);
+    }
+
+    function revokeWallet(address wallet) external onlyOwner {
+        authorizedWallets[wallet] = false;
+        emit WalletRevoked(wallet);
+    }
+
+    function routeDocument(bytes32 documentHash, string calldata fromDesk, string calldata toDesk) external onlyAuthorized {
         if (documentHash == bytes32(0) || bytes(toDesk).length == 0) revert InvalidInput();
         if (_documentStates[documentHash].isCompleted) revert DocumentAlreadyCompleted();
 
@@ -56,7 +81,7 @@ contract TurnaroundTimeTracker is Ownable {
         emit DocumentRouted(documentHash, fromDesk, toDesk, block.timestamp);
     }
 
-    function completeDocument(bytes32 documentHash) external onlyOwner {
+    function completeDocument(bytes32 documentHash) external onlyAuthorized {
         if (_documentStates[documentHash].timeReceived == 0) revert DocumentNotStarted();
         if (_documentStates[documentHash].isCompleted) revert DocumentAlreadyCompleted();
 
@@ -75,7 +100,7 @@ export default function App() {
   const [walletAddress, setWalletAddress] = useState("");
   const [status, setStatus] = useState("");
   const [isConnecting, setIsConnecting] = useState(false);
-  const [activeTab, setActiveTab] = useState("route"); // route, complete, view, history, guide, code
+  const [activeTab, setActiveTab] = useState("route");
 
   // Route Form States
   const [fromDeskSelect, setFromDeskSelect] = useState(STANDARD_DESKS[0]);
@@ -89,6 +114,11 @@ export default function App() {
   // Complete Document State
   const [completeHash, setCompleteHash] = useState("");
   const [completing, setCompleting] = useState("");
+
+  // Admin / Wallet Authorization States
+  const [targetWallet, setTargetWallet] = useState("");
+  const [isOwner, setIsOwner] = useState(false);
+  const [adminLoading, setAdminLoading] = useState(false);
 
   // History & Lookup States
   const [historyList, setHistoryList] = useState([]);
@@ -104,7 +134,9 @@ export default function App() {
           const provider = new ethers.BrowserProvider(window.ethereum);
           const accounts = await provider.send("eth_accounts", []);
           if (accounts.length > 0) {
-            setWalletAddress(accounts[0]);
+            const userAcc = accounts[0];
+            setWalletAddress(userAcc);
+            checkIfOwner(userAcc);
           }
         } catch (err) {
           console.error("Auto-detect connection error:", err);
@@ -126,12 +158,29 @@ export default function App() {
       window.ethereum.on('accountsChanged', (accounts) => {
         if (accounts.length > 0) {
           setWalletAddress(accounts[0]);
+          checkIfOwner(accounts[0]);
         } else {
           setWalletAddress("");
+          setIsOwner(false);
         }
       });
     }
   }, []);
+
+  async function checkIfOwner(acc) {
+    try {
+      const provider = new ethers.JsonRpcProvider("https://rpc.sepolia.org");
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
+      const contractOwner = await contract.owner();
+      if (contractOwner.toLowerCase() === acc.toLowerCase()) {
+        setIsOwner(true);
+      } else {
+        setIsOwner(false);
+      }
+    } catch (err) {
+      console.error("Error checking owner:", err);
+    }
+  }
 
   const saveToHistory = (hash, tx, from, to) => {
     const newItem = { hash, txHash: tx, fromDesk: from, toDesk: to, date: new Date().toLocaleString() };
@@ -176,14 +225,46 @@ export default function App() {
       const provider = new ethers.BrowserProvider(window.ethereum);
       await provider.send("eth_requestAccounts", []);
       const signer = await provider.getSigner();
+      const addr = await signer.getAddress();
       
-      setWalletAddress(await signer.getAddress());
+      setWalletAddress(addr);
+      checkIfOwner(addr);
       setStatus("Wallet connected successfully!");
     } catch (err) {
       console.error(err);
       setStatus(`Error: ${err.reason || err.message}`);
     } finally {
       setIsConnecting(false);
+    }
+  }
+
+  async function handleAuthorizeWallet(e) {
+    e.preventDefault();
+    if (!isOwner) {
+      setStatus("Only the contract owner can authorize staff wallets.");
+      return;
+    }
+    if (!targetWallet) return;
+
+    try {
+      setAdminLoading(true);
+      setStatus(`Authorizing staff wallet ${targetWallet.slice(0, 6)}...`);
+
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+
+      const tx = await contract.authorizeWallet(targetWallet.trim());
+      setStatus(`Authorization broadcasted! Tx: ${tx.hash.slice(0, 10)}... Waiting for confirmation.`);
+      
+      const receipt = await tx.wait();
+      setStatus(`Success! Staff wallet authorized in block #${receipt.blockNumber}`);
+      setTargetWallet("");
+    } catch (err) {
+      console.error(err);
+      setStatus(`Execution Failed: ${err.reason || err.message}`);
+    } finally {
+      setAdminLoading(false);
     }
   }
 
@@ -309,7 +390,7 @@ export default function App() {
         </div>
 
         {/* Minimalist Tabs */}
-        <div className="grid grid-cols-6 border-b-2 border-emerald-800 bg-emerald-50 text-emerald-900 text-center font-bold text-[9px] md:text-[10px] uppercase tracking-wider">
+        <div className="grid grid-cols-7 border-b-2 border-emerald-800 bg-emerald-50 text-emerald-900 text-center font-bold text-[8px] md:text-[9px] uppercase tracking-wider">
           <button
             onClick={() => setActiveTab("route")}
             className={`py-3 transition-all cursor-pointer ${
@@ -327,8 +408,16 @@ export default function App() {
             Complete
           </button>
           <button
-            onClick={() => setActiveTab("view")}
+            onClick={() => setActiveTab("admin")}
             className={`py-3 transition-all cursor-pointer ${
+              activeTab === "admin" ? "bg-emerald-800 text-white" : "hover:bg-emerald-100"
+            }`}
+          >
+            Access
+          </button>
+          <button
+            onClick={() => setActiveTab("view")}
+            className={`py-3 transition-all border-x border-emerald-800 cursor-pointer ${
               activeTab === "view" ? "bg-emerald-800 text-white" : "hover:bg-emerald-100"
             }`}
           >
@@ -336,7 +425,7 @@ export default function App() {
           </button>
           <button
             onClick={() => setActiveTab("history")}
-            className={`py-3 transition-all border-x border-emerald-800 cursor-pointer ${
+            className={`py-3 transition-all cursor-pointer ${
               activeTab === "history" ? "bg-emerald-800 text-white" : "hover:bg-emerald-100"
             }`}
           >
@@ -344,7 +433,7 @@ export default function App() {
           </button>
           <button
             onClick={() => setActiveTab("guide")}
-            className={`py-3 transition-all cursor-pointer ${
+            className={`py-3 transition-all border-x border-emerald-800 cursor-pointer ${
               activeTab === "guide" ? "bg-emerald-800 text-white" : "hover:bg-emerald-100"
             }`}
           >
@@ -352,7 +441,7 @@ export default function App() {
           </button>
           <button
             onClick={() => setActiveTab("code")}
-            className={`py-3 transition-all border-l border-emerald-800 cursor-pointer ${
+            className={`py-3 transition-all cursor-pointer ${
               activeTab === "code" ? "bg-emerald-800 text-white" : "hover:bg-emerald-100"
             }`}
           >
@@ -374,7 +463,9 @@ export default function App() {
             ) : (
               <div className="p-3 border border-emerald-700 bg-emerald-50 flex justify-between items-center rounded">
                 <div>
-                  <p className="text-[10px] font-bold uppercase text-emerald-800">Connected Admin Node</p>
+                  <p className="text-[10px] font-bold uppercase text-emerald-800">
+                    Connected Node {isOwner && "(Contract Owner)"}
+                  </p>
                   <p className="text-xs font-mono text-emerald-950 font-semibold">{walletAddress.slice(0, 8)}...{walletAddress.slice(-6)}</p>
                 </div>
                 <span className="inline-block w-2.5 h-2.5 bg-emerald-600 rounded-full animate-pulse"></span>
@@ -464,6 +555,43 @@ export default function App() {
             </form>
           )}
 
+          {activeTab === "admin" && (
+            <div className="space-y-4">
+              <div className="border-l-2 border-emerald-800 pl-3 py-0.5">
+                <h3 className="font-bold uppercase text-emerald-900 text-xs">Staff Access Control (Whitelist)</h3>
+                <p className="text-[11px] text-stone-600 mt-0.5">Authorize office personnel wallets to route documents securely.</p>
+              </div>
+
+              {!isOwner ? (
+                <div className="p-4 bg-amber-50 border border-amber-300 text-amber-900 text-xs rounded">
+                  ⚠️ Note: Only the main contract owner wallet can authorize new staff addresses. Your current connected wallet is recognized as standard personnel.
+                </div>
+              ) : (
+                <form onSubmit={handleAuthorizeWallet} className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-bold uppercase mb-1 text-emerald-950">Staff Wallet Address (0x...)</label>
+                    <input 
+                      type="text" 
+                      placeholder="0x..."
+                      value={targetWallet}
+                      onChange={(e) => setTargetWallet(e.target.value)}
+                      className="w-full p-2.5 border border-emerald-700 font-mono text-xs focus:outline-none rounded"
+                      required
+                    />
+                  </div>
+
+                  <button 
+                    type="submit"
+                    disabled={adminLoading}
+                    className="w-full py-3 bg-emerald-800 hover:bg-emerald-900 text-white font-bold uppercase tracking-widest text-xs transition-all cursor-pointer disabled:opacity-50 shadow rounded"
+                  >
+                    {adminLoading ? "Authorizing..." : "Authorize Wallet on Blockchain"}
+                  </button>
+                </form>
+              )}
+            </div>
+          )}
+
           {activeTab === "view" && (
             <div className="space-y-4">
               <form onSubmit={(e) => { e.preventDefault(); handleLookup(); }} className="space-y-4">
@@ -550,30 +678,23 @@ export default function App() {
 
               <div className="space-y-3 font-mono text-[11px]">
                 <div className="p-2.5 bg-stone-50 border border-emerald-700 rounded">
-                  <span className="font-bold text-emerald-900">1. struct DocumentState</span>
+                  <span className="font-bold text-emerald-900">1. authorizedWallets mapping</span>
                   <p className="font-sans text-[11px] text-stone-600 mt-1">
-                    Stores record properties on-chain: <code className="bg-emerald-100 px-1 text-emerald-900">currentDesk</code>, <code className="bg-emerald-100 px-1 text-emerald-900">timeReceived</code>, and <code className="bg-emerald-100 px-1 text-emerald-900">isCompleted</code>.
+                    Enforces that only whitelisted office personnel or admin nodes can execute routing actions.
                   </p>
                 </div>
 
                 <div className="p-2.5 bg-stone-50 border border-emerald-700 rounded">
                   <span className="font-bold text-emerald-900">2. routeDocument(...)</span>
                   <p className="font-sans text-[11px] text-stone-600 mt-1">
-                    Protected by OpenZeppelin's <code className="bg-emerald-100 px-1 text-emerald-900">onlyOwner</code> modifier. Updates document location and etches an unalterable timestamp.
+                    Protected by the <code className="bg-emerald-100 px-1 text-emerald-900">onlyAuthorized</code> modifier to log the document location and block timestamp securely.
                   </p>
                 </div>
 
                 <div className="p-2.5 bg-stone-50 border border-emerald-700 rounded">
                   <span className="font-bold text-emerald-900">3. completeDocument(...)</span>
                   <p className="font-sans text-[11px] text-stone-600 mt-1">
-                    Locks the document state permanently upon clearance, stopping the turnaround clock.
-                  </p>
-                </div>
-
-                <div className="p-2.5 bg-stone-50 border border-emerald-700 rounded">
-                  <span className="font-bold text-emerald-900">4. getDocumentState(...)</span>
-                  <p className="font-sans text-[11px] text-stone-600 mt-1">
-                    Public read-only view function. Pulls real-time workflow status directly from the public Sepolia ledger.
+                    Permanently closes the document lifecycle, stopping the turnaround clock upon clearance.
                   </p>
                 </div>
               </div>
